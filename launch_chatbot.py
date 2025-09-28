@@ -15,7 +15,6 @@ from langchain_ollama import OllamaEmbeddings
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain.agents import create_tool_calling_agent
-from langchain import hub
 from langchain_core.prompts import PromptTemplate
 from langchain_core.tools import tool
 
@@ -106,11 +105,12 @@ def get_history_path() -> str:
     return path
 
 
-def load_history():
-    msgs = []
+def load_all_records() -> list[dict]:
+    """Load raw JSONL records from the history file (backward compatible)."""
+    records: list[dict] = []
     path = get_history_path()
     if not os.path.exists(path):
-        return msgs
+        return records
     try:
         with open(path, "r", encoding="utf-8") as f:
             for line in f:
@@ -119,37 +119,136 @@ def load_history():
                     continue
                 try:
                     obj = json.loads(line)
+                    if isinstance(obj, dict):
+                        records.append(obj)
                 except json.JSONDecodeError:
                     continue
-                role = obj.get("role")
-                content = obj.get("content", "")
-                if not content:
-                    continue
-                if role == "user":
-                    msgs.append(HumanMessage(content))
-                elif role in ("assistant", "ai", "bot"):
-                    msgs.append(AIMessage(content))
     except Exception:
+        # ignore corrupted history silently
         pass
+    return records
+
+
+def list_sessions(records: list[dict]) -> list[dict]:
+    """Aggregate sessions from records.
+    Returns list of dicts: {chat_id, name, count, last_ts}
+    Backward compatibility: messages without chat_id belong to a 'legacy' session.
+    """
+    sessions: dict[str, dict] = {}
+    for r in records:
+        chat_id = r.get("chat_id") or "legacy"
+        chat_name = r.get("chat_name") or ("Legacy" if chat_id == "legacy" else "Unnamed Chat")
+        ts = r.get("ts") or ""
+        s = sessions.get(chat_id)
+        if not s:
+            sessions[chat_id] = {"chat_id": chat_id, "name": chat_name, "count": 0, "last_ts": ts}
+            s = sessions[chat_id]
+        role = r.get("role")
+        if role in ("user", "assistant", "ai", "bot"):
+            s["count"] += 1
+        if chat_name:
+            s["name"] = chat_name
+        if ts and (not s["last_ts"] or ts > s["last_ts"]):
+            s["last_ts"] = ts
+    return sorted(sessions.values(), key=lambda x: x["last_ts"] or "", reverse=True)
+
+
+def load_session_messages(records: list[dict], chat_id: str) -> list:
+    msgs = []
+    for r in records:
+        rid = r.get("chat_id") or "legacy"
+        if rid != chat_id:
+            continue
+        role = r.get("role")
+        content = r.get("content", "")
+        if not content:
+            continue
+        if role == "user":
+            msgs.append(HumanMessage(content))
+        elif role in ("assistant", "ai", "bot"):
+            msgs.append(AIMessage(content))
     return msgs
 
 
-def append_history(role: str, content: str, request_id: str | None = None) -> None:
-    rec = {"ts": datetime.utcnow().isoformat() + "Z", "role": role, "content": content}
+def append_history(role: str, content: str, request_id: str | None = None, chat_id: str | None = None, chat_name: str | None = None) -> None:
+    rec = {
+        "ts": datetime.utcnow().isoformat() + "Z",
+        "role": role,
+        "content": content,
+    }
     if request_id:
         rec["request_id"] = request_id
+    if chat_id:
+        rec["chat_id"] = chat_id
+    if chat_name:
+        rec["chat_name"] = chat_name
     with open(get_history_path(), "a", encoding="utf-8") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 # initiating streamlit app
-st.set_page_config(page_title="Agentic RAG Chatbot", page_icon="🦜")
-st.title("🦜 Agentic RAG Chatbot")
+st.set_page_config(page_title="Personal Chatbot", page_icon="🦜", layout="wide")
+# Header with logo and title on the same line
+logo_col, title_col = st.columns([1, 12])
+with logo_col:
+    st.image("resources/images/personal_chatbot_ai_friend.png", width=32)
+with title_col:
+    st.title("Personal Chatbot")
 
-# initialize chat history
+# Load all records and available sessions
+records = load_all_records()
+sessions = list_sessions(records)
+
+# Initialize session state for current chat
+if "current_chat_id" not in st.session_state:
+    if sessions:
+        st.session_state.current_chat_id = sessions[0]["chat_id"]
+        st.session_state.current_chat_name = sessions[0]["name"]
+    else:
+        st.session_state.current_chat_id = str(uuid4())
+        st.session_state.current_chat_name = "New Chat"
+if "loaded_chat_id" not in st.session_state:
+    st.session_state.loaded_chat_id = None
 if "messages" not in st.session_state:
-    st.session_state.messages = load_history()
+    st.session_state.messages = []
 
-# display chat messages from history on app rerun
+# Sidebar for chat sessions
+with st.sidebar:
+    st.header("Chats")
+
+    # New chat creation
+    default_new_name = st.session_state.get("new_chat_name") or f"New Chat {datetime.now().strftime('%b %d %H:%M')}"
+    new_name = st.text_input("New chat name", value=default_new_name, key="new_chat_name")
+    if st.button("➕ New Chat"):
+        st.session_state.current_chat_id = str(uuid4())
+        st.session_state.current_chat_name = new_name.strip() or "New Chat"
+        st.session_state.messages = []  # start without pulling any history
+        st.session_state.loaded_chat_id = st.session_state.current_chat_id
+        st.rerun()
+
+    # Sessions list
+    options = [f"{s['name']} ({s['count']})" for s in sessions]
+    ids = [s["chat_id"] for s in sessions]
+    idx = ids.index(st.session_state.current_chat_id) if st.session_state.current_chat_id in ids else (0 if ids else -1)
+    selected = st.selectbox("All sessions", options, index=idx if idx >= 0 else None)
+    if selected:
+        sel_idx = options.index(selected)
+        sel_id = ids[sel_idx]
+        if sel_id != st.session_state.current_chat_id:
+            st.session_state.current_chat_id = sel_id
+            st.session_state.current_chat_name = sessions[sel_idx]["name"]
+            st.session_state.messages = load_session_messages(records, sel_id)
+            st.session_state.loaded_chat_id = sel_id
+            st.rerun()
+
+    # Rename current chat (kept in state, persisted on next message write)
+    st.text_input("Chat name", key="current_chat_name", value=st.session_state.current_chat_name)
+
+# Ensure current session messages are loaded once per session selection
+if st.session_state.loaded_chat_id != st.session_state.current_chat_id:
+    st.session_state.messages = load_session_messages(records, st.session_state.current_chat_id)
+    st.session_state.loaded_chat_id = st.session_state.current_chat_id
+
+# Display chat messages for the current session
 for message in st.session_state.messages:
     if isinstance(message, HumanMessage):
         with st.chat_message("user"):
@@ -158,33 +257,33 @@ for message in st.session_state.messages:
         with st.chat_message("assistant"):
             st.markdown(message.content)
 
+# Input box uses current chat name for friendliness
+user_question = st.chat_input(f"Message {st.session_state.current_chat_name}…")
 
-# create the bar where we can type messages
-user_question = st.chat_input("How are you?")
-
-
-# did the user submit a prompt?
+# Handle user input
 if user_question:
-
-    # add the message from the user (prompt) to the screen with streamlit
     request_id = str(uuid4())
+    chat_id = st.session_state.current_chat_id
+    chat_name = st.session_state.current_chat_name
+
+    # Show and persist the user message
     with st.chat_message("user"):
         st.markdown(user_question)
         st.session_state.messages.append(HumanMessage(user_question))
-        append_history("user", user_question, request_id)
+        append_history("user", user_question, request_id, chat_id=chat_id, chat_name=chat_name)
 
-    # invoking the agent
+    # Invoke the agent using only this session's history
     try:
-        result = agent_executor.invoke({"input": user_question, "chat_history": st.session_state.messages})
+        result = agent_executor.invoke({"input": user_question, "chat_history": st.session_state.messages, "chat_id": chat_id})
         ai_message = result.get("output", "")
         if not ai_message:
             ai_message = "I don't know."
     except Exception as e:
         ai_message = f"Sorry, something went wrong while generating a response. ({e})"
 
-    # adding the response from the llm to the screen (and chat)
+    # Show and persist the assistant message
     with st.chat_message("assistant"):
         st.markdown(ai_message)
         st.session_state.messages.append(AIMessage(ai_message))
-        append_history("assistant", ai_message, request_id)
+        append_history("assistant", ai_message, request_id, chat_id=chat_id, chat_name=chat_name)
 

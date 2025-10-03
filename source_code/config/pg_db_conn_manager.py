@@ -34,7 +34,6 @@ def get_db_connection():
     finally:
         if conn:
             conn.close()
-            print("Database connection closed.")
 
 
 def dict_fetch_all(cursor) -> List[Dict[str, Any]]:

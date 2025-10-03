@@ -100,7 +100,7 @@ agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
 # ===== Chat history persistence helpers =====
 
 def get_history_path() -> str:
-    path = os.getenv("CHAT_HISTORY_FILE") or os.path.join("datasets", "chat_history.jsonl")
+    path = os.getenv("CHAT_HISTORY_FILE") or os.path.join("../datasets", "chat_history.jsonl")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     return path
 

@@ -137,7 +137,7 @@ def main():
         help="Directory to scan for input files (default: datasets)",
     )
     # Determine default output path from environment with safe fallbacks
-    default_output = os.path.join("datasets", "data.txt")
+    default_output = os.path.join("../datasets", "data.txt")
     folder = os.getenv("DATASET_STORAGE_FOLDER")
     file_name = os.getenv("DATASET_STORAGE_FILE_NAME")
     if folder:

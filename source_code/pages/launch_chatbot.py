@@ -182,6 +182,53 @@ def append_history(role: str, content: str, request_id: str | None = None, chat_
 
 # initiating streamlit app
 
+# ===== DB persistence for chat_history (Postgres) =====
+import importlib
+try:
+    models_mod = importlib.import_module("config.models")
+    crud_mod = importlib.import_module("crud")
+except ModuleNotFoundError:
+    # Support running as a module or script
+    models_mod = importlib.import_module("source_code.config.models")
+    crud_mod = importlib.import_module("source_code.crud")
+ChatHistoryCreate = getattr(models_mod, "ChatHistoryCreate")
+create_chat_history = getattr(crud_mod, "create_chat_history")
+
+
+def _persist_exchange_to_db(user_inquiry: str, assistant_response: str,
+                            user_id: int = 1, reference_id: int | None = None,
+                            chat_group_id: int | None = None) -> None:
+    """Best-effort insert of a prompt/response pair into personal_chat.chat_history.
+    Generates a bigint-like id based on current UTC time in milliseconds.
+    Fails silently (logs via st.warning) to avoid breaking the UI if DB is down.
+    """
+    try:
+        # Millisecond epoch as increasing bigint id
+        new_id = int(datetime.utcnow().timestamp() * 1000)
+        payload = ChatHistoryCreate(
+            id=new_id,
+            user_id=user_id,
+            user_inquiry=user_inquiry,
+            assistant_response=assistant_response,
+            reference_id=reference_id,
+            chat_group_id=chat_group_id,
+        )
+        rows = create_chat_history(payload)
+        if rows == 0:
+            # Provide a subtle hint; do not interrupt the chat flow
+            try:
+                import streamlit as _st
+                _st.warning("Could not persist chat exchange to database (0 rows affected).", icon="⚠️")
+            except Exception:
+                pass
+    except Exception as e:
+        try:
+            import streamlit as _st
+            _st.warning(f"Database persistence failed: {e}", icon="⚠️")
+        except Exception:
+            pass
+
+
 def render_chatbot_app(use_internal_sidebar: bool = False):
     # Header with logo and title on the same line (compact, no extra top margin)
     logo_col, title_col = st.columns([1, 12])
@@ -194,7 +241,7 @@ def render_chatbot_app(use_internal_sidebar: bool = False):
     records = load_all_records()
     sessions = list_sessions(records)
 
-    # Initialize session state for the current chat
+    # Initialize session state for the current chat (robust against partial state resets)
     if "current_chat_id" not in st.session_state:
         if sessions:
             st.session_state.current_chat_id = sessions[0]["chat_id"]
@@ -202,6 +249,15 @@ def render_chatbot_app(use_internal_sidebar: bool = False):
         else:
             st.session_state.current_chat_id = str(uuid4())
             st.session_state.current_chat_name = "New Chat"
+    # Ensure current_chat_name exists even if another page partially initialized state
+    if "current_chat_name" not in st.session_state:
+        fallback_name = None
+        cur_id = st.session_state.get("current_chat_id")
+        for s in sessions:
+            if s["chat_id"] == cur_id:
+                fallback_name = s.get("name")
+                break
+        st.session_state.current_chat_name = fallback_name or "New Chat"
     if "loaded_chat_id" not in st.session_state:
         st.session_state.loaded_chat_id = None
     if "messages" not in st.session_state:
@@ -245,7 +301,7 @@ def render_chatbot_app(use_internal_sidebar: bool = False):
                 st.rerun()
 
         # Rename current chat (kept in state, persisted on next message write)
-        st.text_input("Chat name", key="current_chat_name", value=st.session_state.current_chat_name)
+        st.text_input("Chat name", key="current_chat_name", value=st.session_state.get("current_chat_name", "New Chat"))
 
     # Ensure current session messages are loaded once per session selection
     if st.session_state.loaded_chat_id != st.session_state.current_chat_id:
@@ -253,7 +309,32 @@ def render_chatbot_app(use_internal_sidebar: bool = False):
         st.session_state.loaded_chat_id = st.session_state.current_chat_id
 
     def _render_messages_and_input():
-        # Display chat messages for the current session
+        # Global styles to keep chat input fixed at bottom and ensure scrollbars are visible
+        st.markdown(
+            """
+            <style>
+            /* Make chat input fixed at the bottom and always visible */
+            [data-testid="stChatInput"] {
+                position: fixed !important;
+                bottom: 0; left: 0; right: 0;
+                z-index: 100;
+                background: var(--background-color, #ffffff);
+                border-top: 1px solid #e6e6e6;
+            }
+            /* Ensure the scroll area accounts for the fixed input's height */
+            #chat-scroll-area { padding-bottom: 140px; }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        # Display chat messages for the current session inside a scrollable container (like ChatGPT/Perplexity)
+        st.markdown(
+            """
+            <div id='chat-scroll-area' style='height: calc(100vh - 260px); overflow-y: scroll; padding: 0 8px; border-left: 1px solid #e6e6e6; border-right: 1px solid #e6e6e6;'>
+            """,
+            unsafe_allow_html=True,
+        )
         for message in st.session_state.messages:
             if isinstance(message, HumanMessage):
                 with st.chat_message("user"):
@@ -261,9 +342,10 @@ def render_chatbot_app(use_internal_sidebar: bool = False):
             elif isinstance(message, AIMessage):
                 with st.chat_message("assistant"):
                     st.markdown(message.content)
+        st.markdown("</div>", unsafe_allow_html=True)
 
-        # Input box uses current chat name for friendliness
-        user_question = st.chat_input(f"Message {st.session_state.current_chat_name}…")
+        # Input box uses current chat name for friendliness and is kept at the bottom of the page
+        user_question = st.chat_input(f"Ask {st.session_state.get('current_chat_name', 'Chat')} anything…")
 
         # Handle user input
         if user_question:
@@ -271,11 +353,9 @@ def render_chatbot_app(use_internal_sidebar: bool = False):
             chat_id = st.session_state.current_chat_id
             chat_name = st.session_state.current_chat_name
 
-            # Show and persist the user message
-            with st.chat_message("user"):
-                st.markdown(user_question)
-                st.session_state.messages.append(HumanMessage(user_question))
-                append_history("user", user_question, request_id, chat_id=chat_id, chat_name=chat_name)
+            # Persist the user message first (do not render inline below the input)
+            st.session_state.messages.append(HumanMessage(user_question))
+            append_history("user", user_question, request_id, chat_id=chat_id, chat_name=chat_name)
 
             # Invoke the agent using only this session's history
             try:
@@ -287,11 +367,13 @@ def render_chatbot_app(use_internal_sidebar: bool = False):
             except Exception as e:
                 ai_message = f"Sorry, something went wrong while generating a response. ({e})"
 
-            # Show and persist the assistant message
-            with st.chat_message("assistant"):
-                st.markdown(ai_message)
-                st.session_state.messages.append(AIMessage(ai_message))
-                append_history("assistant", ai_message, request_id, chat_id=chat_id, chat_name=chat_name)
+            # Persist the assistant message and DB record
+            st.session_state.messages.append(AIMessage(ai_message))
+            append_history("assistant", ai_message, request_id, chat_id=chat_id, chat_name=chat_name)
+            _persist_exchange_to_db(user_question, ai_message)
+
+            # Rerun so the newly added messages render ABOVE the input (in the history area)
+            st.rerun()
 
     if use_internal_sidebar:
         with main_col:
